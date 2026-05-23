@@ -1,0 +1,12 @@
+.venv/
+.uv-cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+
+data/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+.env

@@ -1,80 +1,102 @@
-# TD-LLM-DND
+# DND-LLM-GAME
 
-TD-LLM-DND is a Streamlit-based web application that creates a Dungeons & Dragons style adventure using locally hosted llm from ollama.
-
-Players can generate characters, start new adventures, and progress through turns with an automated Dungeon Master, AI powered party members and player interactions (TO:DO).
-
-![screen](/current/td-llm-dnd.png)
+Local-first D&D web app powered by Ollama. The app runs a local Dungeon Master model, a smaller utility model for rules/state/action extraction, streamed responses, dice prompts, reusable heroes, campaign history, and optional PDF lore/RAG.
 
 ## Features
 
-- **Generate D&D Characters**: Create unique characters with name, race, class, backstory, and items
-- **Start New Adventure**: Begin a new adventure with the generated characters
-- **Turn-Based Gameplay**: Progress through the adventure with player and Dungeon Master turns (TO:DO - add player input)
-- **Manage Models**: Select/download and manage language models for the Dungeon Master and AI players
+- Local DM narration through Ollama
+- Separate utility model for dice checks, scene state, and player choices
+- FastAPI backend with streamed Server-Sent Events
+- Vite React frontend launched by Bun
+- SQLite app database through SQLModel
+- LanceDB local vector store for uploaded PDF lore
+- Hero manager with reusable player characters
+- Campaign intro generation from the campaign brief and selected heroes
+- Click-to-roll dice checks when the rules referee requires uncertainty
+
+![dnd-llm-game-screen](dnd-llm-game-screen.png)
 
 ## Requirements
 
-- Python 3.8+
-- Streamlit
-- Requests
-- LangChain
-- HuggingFace Transformers
-- dotenv
+- [Bun](https://bun.sh/)
+- Python 3.11+
+- [Ollama](https://ollama.com/) running locally
 
-## Installation
+The launcher installs/syncs Python packages with `uv` and frontend packages with Bun. If `uv` is missing, it attempts to install it with Python.
 
-1. **Clone the repository**:
-    ```
-    git clone https://github.com/tegridydev/dnd-llm-game.git
-    cd td-llm-dnd
-    ```
+## Quick Start
 
-2. **Create and activate a virtual environment**:
-    ```
-    python -m venv venv
-    source venv/bin/activate  # On Windows, use `venv\Scripts\activate`
-    ```
+```bash
+git clone https://github.com/tegridydev/dndllm26.git
+cd dndllm26
+bun run dev
+```
 
-3. **Install the dependencies**:
-    ```
-    pip install -r requirements.txt
-    ```
+The launcher will:
 
-4. **Set up environment variables**:
-    Create a `.env` file in the root directory with the following content:
-    ```plaintext
-    OLLAMA_API_ENDPOINT=http://localhost:11434/api/generate
-    PDF_FOLDER=pdf
-    CHROMA_DB_DIR=./chroma_db
-    TURN_LIMIT=10
-    ```
+- create/sync `.venv`
+- install frontend packages
+- start FastAPI on `http://127.0.0.1:8765`
+- start Vite on `http://localhost:5173`
+- open the browser automatically
 
-## Usage
+## Ollama Models
 
-1. **Start Ollama**:
-    ```
-    ollama serve
-    ```
+Start Ollama first:
 
-2. **Run the Streamlit app**:
-    ```
-    streamlit run app.py
-    ```
+```bash
+ollama serve
+```
 
-3. **Access the app**:
-    Open your browser and go to `http://localhost:8501`.
+Pull the default models:
 
-## How to Play
+```bash
+ollama pull llama3.2:1b
+ollama pull granite4:350m
+ollama pull nomic-embed-text
+```
 
-1. Generate a new party.
-2. Start a new adventure.
-3. Play the next turn.
+Copy `.env.example` to `.env` if you want custom models or ports:
 
-May your dice roll high!
+```bash
+cp .env.example .env
+```
 
-## Contributing
+Model settings:
 
-Contributions are welcome! Please fork the repository and submit a pull request!
+```env
+OLLAMA_CHAT_MODEL=llama3.2:1b
+OLLAMA_UTILITY_MODEL=granite4:350m
+OLLAMA_EMBED_MODEL=nomic-embed-text
+```
 
+`OLLAMA_CHAT_MODEL` is the main DM narrator. `OLLAMA_UTILITY_MODEL` should be a smaller/faster model used for dice decisions, world-state extraction, and dynamic player choices. If it is blank, the app falls back to the main chat model.
 
+## Using Lore PDFs
+
+Upload PDFs from the Lore panel, or place PDFs in `data/uploads`. The app discovers queued PDFs and indexes them into LanceDB using the configured embedding model. Indexed lore is retrieved into DM prompts and rules/state context.
+
+Runtime data is stored in `data/` and is intentionally ignored by git.
+
+## Scripts
+
+```bash
+bun run dev      # sync deps, start backend + frontend, open browser
+bun run start    # same as dev
+bun run build    # type-check and build the frontend
+```
+
+## Project Layout
+
+- `backend/dndllm26/api`: FastAPI routes
+- `backend/dndllm26/core`: settings
+- `backend/dndllm26/db`: SQLite models and sessions
+- `backend/dndllm26/game`: campaign, dice, hero, and world-state orchestration
+- `backend/dndllm26/llm`: Ollama client
+- `backend/dndllm26/rag`: PDF extraction, chunking, LanceDB search
+- `frontend/src`: React app and styles
+- `scripts/start-dev.ts`: one-command local launcher
+
+## Notes
+
+DM responses are capped for playability (Feel free to change and experiment!): max 1000 characters and max 200 words. The utility model generates the player-choice buttons after each DM response, so the main DM can focus on narration.
