@@ -72,7 +72,7 @@ Se você preferir executar sem Docker, certifique-se de possuir o **Bun** e o **
 
 1. Clone o repositório e acesse a pasta do projeto:
    ```bash
-   git clone https://github.com/tegridydev/dnd-llm-game.git
+   git clone https://github.com/ymtec90/dnd-llm-game.git
    cd dnd-llm-game
    ```
 2. Inicialize o ambiente local com o launcher automático:
