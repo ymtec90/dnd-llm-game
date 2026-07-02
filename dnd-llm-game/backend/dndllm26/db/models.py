@@ -108,3 +108,41 @@ class WorldState(SQLModel, table=True):
     scene_summary: str = ""
     choices_json: str = "[]"
     updated_at: datetime = Field(default_factory=now_utc)
+
+
+class GameSession(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    campaign_id: int = Field(index=True, foreign_key="campaign.id")
+    name: str
+    lore_pack: Optional[str] = None
+    current_location: str = "Abertura da campanha"
+    active_objective: str = "Estabelecer a primeira cena."
+    scene_summary: str = ""
+    choices_json: str = "[]"
+    created_at: datetime = Field(default_factory=now_utc)
+    updated_at: datetime = Field(default_factory=now_utc)
+
+
+class CharacterStatus(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    game_session_id: int = Field(index=True, foreign_key="gamesession.id")
+    character_id: int = Field(index=True, foreign_key="character.id")
+    name: str
+    ancestry: str
+    character_class: str
+    backstory: str
+    inventory: str = "[]"
+    is_human: bool = False
+    hp: int = 10
+    max_hp: int = 10
+    level: int = 1
+    xp: int = 0
+    gold: int = 0
+
+
+class CampaignMessage(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    game_session_id: int = Field(index=True, foreign_key="gamesession.id")
+    speaker: str
+    content: str
+    created_at: datetime = Field(default_factory=now_utc)

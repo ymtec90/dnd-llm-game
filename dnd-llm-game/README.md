@@ -1,102 +1,133 @@
-# DND-LLM-GAME
+# DnD LLM Game 🎲 (Versão Gold Master - v1.0.0)
 
-Local-first D&D web app powered by Ollama. The app runs a local Dungeon Master model, a smaller utility model for rules/state/action extraction, streamed responses, dice prompts, reusable heroes, campaign history, and optional PDF lore/RAG.
+O **dnd-llm-game** é um motor digital e interativo de RPG de Mesa (Dungeons & Dragons) guiado por inteligência artificial local (Ollama). O sistema atua como Mestre da Campanha (DM) utilizando um modelo de conversação para narrar aventuras, outro modelo utilitário rápido para resolver as regras, testes de perícia com dados reais em 3D, um gerenciador completo de salvamento de sessões, progressão de personagens (XP/Level Up), e RAG segmentado para Lore Packs temáticos.
 
-## Features
+---
 
-- Local DM narration through Ollama
-- Separate utility model for dice checks, scene state, and player choices
-- FastAPI backend with streamed Server-Sent Events
-- Vite React frontend launched by Bun
-- SQLite app database through SQLModel
-- LanceDB local vector store for uploaded PDF lore
-- Hero manager with reusable player characters
-- Campaign intro generation from the campaign brief and selected heroes
-- Click-to-roll dice checks when the rules referee requires uncertainty
+## 🌟 Principais Recursos (v1.0.0)
 
-![dnd-llm-game-screen](dnd-llm-game-screen.png)
+1. **Mestre Local com IA**: Narração contextual em tempo real de forma fluida via Ollama.
+2. **Streaming SSE (Server-Sent Events)**: As respostas do Mestre são exibidas na tela caractere por caractere (efeito Typing) com latência imperceptível.
+3. **Mecânica Referee (Dados 3D)**: Testes de perícia interativos (D20, D6, etc.) integrados ao fluxo do jogo.
+4. **Sistema de Save & Load**: Persistência total dos estados da campanha e histórico com SQLModel no SQLite.
+5. **Inventário & Progressão**: Adquira itens, gerencie ouro e sofra dano ou cure-se. Mecânica de **Level Up** a cada 100 * Nível XP que aumenta o HP máximo e regenera a vida.
+6. **Motor de Lore Temático (RAG)**: Troque o cenário da campanha inteira através de Lore Packs (como *Grimdark Sci-Fi* ou *Brasil Colonial*). A busca vetorial no **LanceDB** segmenta estritamente os dados de cada universo.
 
-## Requirements
+---
 
-- [Bun](https://bun.sh/)
-- Python 3.11+
-- [Ollama](https://ollama.com/) running locally
+## 🏗️ Arquitetura e Stack Técnica
 
-The launcher installs/syncs Python packages with `uv` and frontend packages with Bun. If `uv` is missing, it attempts to install it with Python.
+O projeto é dividido em uma estrutura moderna de microsserviços desacoplados:
 
-## Quick Start
+```mermaid
+graph TD
+    Client[React Frontend / Bun / Vite] -->|Requisições HTTP & SSE| Server[FastAPI Backend]
+    Server -->|Persistência de Saves| SQLite[(SQLite / SQLModel)]
+    Server -->|Embeddings & Busca Vetorial| LanceDB[(LanceDB RAG Store)]
+    Server -->|Prompt Orquestração| Ollama[Ollama Local LLM]
+```
 
+*   **Frontend**: React (SPA), Vite, TypeScript, Bun (gerenciador de pacotes e runtime), Vanilla CSS.
+*   **Backend**: Python 3.11+, FastAPI (servidor assíncrono), SQLModel/SQLAlchemy (banco SQLite relacional).
+*   **Banco de Dados**: SQLite para dados transacionais e históricos; **LanceDB** como banco vetorial para RAG.
+*   **Inteligência Artificial**: **Ollama** executando os modelos locally:
+    *   `nomic-embed-text` (geração de vetores RAG).
+    *   `llama3.2` ou similar (modelo principal de narração chat).
+    *   `granite4:350m` ou similar (modelo utilitário rápido de regras).
+
+---
+
+## 🚀 Como Executar
+
+### Pré-requisitos (Ollama Host)
+
+Antes de iniciar os containers ou rodar localmente, você precisa do Ollama rodando na sua máquina host:
+1. Baixe e instale em [ollama.com](https://ollama.com).
+2. Baixe os modelos necessários no terminal:
+   ```bash
+   ollama pull llama3.2
+   ollama pull nomic-embed-text
+   ```
+
+---
+
+### Método 1: Containerização Completa (Docker Compose - Recomendado)
+
+Toda a infraestrutura do projeto (Frontend Nginx e Backend FastAPI) pode ser iniciada com um único comando. O backend se comunica com o Ollama no host local através do endereço `host.docker.internal`.
+
+1. Suba os containers:
+   ```bash
+   docker-compose up --build
+   ```
+2. Acesse a aplicação no navegador em:
+   [http://localhost](http://localhost)
+
+*Os saves de jogo e os vetores do LanceDB são persistidos no volume nomeado `backend_data`.*
+
+---
+
+### Método 2: Execução Manual (Desenvolvimento Local)
+
+Se você preferir executar sem Docker, certifique-se de possuir o **Bun** e o **Python 3.11+** instalados.
+
+1. Clone o repositório e acesse a pasta do projeto:
+   ```bash
+   git clone https://github.com/tegridydev/dnd-llm-game.git
+   cd dnd-llm-game
+   ```
+2. Inicialize o ambiente local com o launcher automático:
+   ```bash
+   bun run dev
+   ```
+   *O script irá sincronizar as dependências do Python no ambiente virtual `.venv`, instalar as dependências do React com Bun, e iniciar ambos os servidores (FastAPI na porta 8765 e Vite na porta 5173).*
+
+---
+
+## 🛠️ Guia de Contribuição (Contributing)
+
+Contribuições de código limpo são muito bem-vindas! Siga o roteiro abaixo para colaborar:
+
+### 1. Configurando o Ambiente
+Crie uma branch a partir da `main`:
 ```bash
-git clone https://github.com/tegridydev/dnd-llm-game.git
-cd dndllm26
-bun run dev
+git checkout -b feature/sua-feature-incrivel
 ```
 
-The launcher will:
+### 2. Padrão de Commits
+Adotamos a especificação de **Conventional Commits**:
+*   `feat:` Nova funcionalidade.
+*   `fix:` Correção de bug.
+*   `docs:` Alteração na documentação.
+*   `style:` Formatação ou CSS sem alteração lógica.
+*   `test:` Adição ou correção de testes.
 
-- create/sync `.venv`
-- install frontend packages
-- start FastAPI on `http://127.0.0.1:8765`
-- start Vite on `http://localhost:5173`
-- open the browser automatically
+Exemplo: `feat(referee): adiciona suporte a rolagem de dados múltiplos`
 
-## Ollama Models
+### 3. Rodando os Testes Automatizados
 
-Start Ollama first:
+Garantir que a cobertura continue verde é obrigatório antes de abrir um PR.
 
+#### Backend (Pytest)
 ```bash
-ollama serve
+.venv/bin/pytest backend/tests/
 ```
 
-Pull the default models:
-
+#### Frontend (Vitest)
 ```bash
-ollama pull llama3.2:1b
-ollama pull granite4:350m
-ollama pull nomic-embed-text
+cd frontend
+bun x vitest run
 ```
 
-Copy `.env.example` to `.env` if you want custom models or ports:
+### 4. Submetendo Pull Requests
+1. Realize o push da sua branch:
+   ```bash
+   git push origin feature/sua-feature-incrivel
+   ```
+2. Abra um Pull Request detalhando as alterações visuais e de regras de negócio.
+3. Aguarde a aprovação do time de Core Developers e o build do CI passar.
 
-```bash
-cp .env.example .env
-```
+---
 
-Model settings:
+## 📄 Licença
 
-```env
-OLLAMA_CHAT_MODEL=llama3.2:1b
-OLLAMA_UTILITY_MODEL=granite4:350m
-OLLAMA_EMBED_MODEL=nomic-embed-text
-```
-
-`OLLAMA_CHAT_MODEL` is the main DM narrator. `OLLAMA_UTILITY_MODEL` should be a smaller/faster model used for dice decisions, world-state extraction, and dynamic player choices. If it is blank, the app falls back to the main chat model.
-
-## Using Lore PDFs
-
-Upload PDFs from the Lore panel, or place PDFs in `data/uploads`. The app discovers queued PDFs and indexes them into LanceDB using the configured embedding model. Indexed lore is retrieved into DM prompts and rules/state context.
-
-Runtime data is stored in `data/` and is intentionally ignored by git.
-
-## Scripts
-
-```bash
-bun run dev      # sync deps, start backend + frontend, open browser
-bun run start    # same as dev
-bun run build    # type-check and build the frontend
-```
-
-## Project Layout
-
-- `backend/dndllm26/api`: FastAPI routes
-- `backend/dndllm26/core`: settings
-- `backend/dndllm26/db`: SQLite models and sessions
-- `backend/dndllm26/game`: campaign, dice, hero, and world-state orchestration
-- `backend/dndllm26/llm`: Ollama client
-- `backend/dndllm26/rag`: PDF extraction, chunking, LanceDB search
-- `frontend/src`: React app and styles
-- `scripts/start-dev.ts`: one-command local launcher
-
-## Notes
-
-DM responses are capped for playability (Feel free to change and experiment!): max 1000 characters and max 200 words. The utility model generates the player-choice buttons after each DM response, so the main DM can focus on narration.
+Este projeto é disponibilizado sob a Licença MIT. Sinta-se livre para customizar as regras e mestrar suas próprias campanhas!

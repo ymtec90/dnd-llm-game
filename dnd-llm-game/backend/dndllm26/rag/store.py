@@ -41,11 +41,31 @@ class RagStore:
     def _table(self):
         db = self._db()
         if self.table_name in db.table_names():
-            return db.open_table(self.table_name)
+            table = db.open_table(self.table_name)
+            try:
+                if "lore_pack" not in table.schema.names:
+                    db.drop_table(self.table_name)
+                    return None
+            except Exception:
+                pass
+            return table
         return None
 
     async def index_pdf(self, path: Path, document_id: int) -> int:
-        text = extract_pdf_text(path)
+        return await self.index_document(path, document_id)
+
+    async def index_document(self, path: Path, document_id: int, lore_pack: str | None = None) -> int:
+        suffix = path.suffix.lower()
+        if suffix == ".pdf":
+            text = extract_pdf_text(path)
+        elif suffix == ".txt":
+            try:
+                text = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                text = path.read_text(encoding="latin-1")
+        else:
+            raise ValueError(f"Formato de arquivo não suportado: {suffix}")
+
         chunks = chunk_text(text)
         rows = []
         for idx, chunk in enumerate(chunks):
@@ -59,6 +79,7 @@ class RagStore:
                     "filename": path.name,
                     "chunk_index": idx,
                     "text": chunk,
+                    "lore_pack": lore_pack or "",
                 }
             )
         if not rows:
@@ -75,6 +96,7 @@ class RagStore:
         query: str,
         limit: int = 4,
         document_ids: list[int] | None = None,
+        lore_pack: str | None = None,
     ) -> list[dict]:
         table = self._table()
         if table is None:
@@ -87,11 +109,16 @@ class RagStore:
             return []
         if not vector:
             return []
-        search_limit = max(limit, limit * 4) if document_ids else limit
-        result = table.search(vector).limit(search_limit).to_list()
-        if document_ids:
-            allowed = set(document_ids)
-            result = [row for row in result if row.get("document_id") in allowed][:limit]
+        
+        query_builder = table.search(vector)
+        if lore_pack:
+            query_builder = query_builder.where(f"lore_pack = '{lore_pack}'")
+        elif document_ids:
+            ids_str = ", ".join(str(i) for i in document_ids)
+            query_builder = query_builder.where(f"document_id IN ({ids_str})")
+            
+        result = query_builder.limit(limit).to_list()
+            
         return [
             {
                 "document_id": row.get("document_id"),

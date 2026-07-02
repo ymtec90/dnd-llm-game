@@ -36,14 +36,29 @@ class OllamaService:
 
     @staticmethod
     def error_message(exc: Exception) -> str:
+        import httpx
+        if isinstance(exc, httpx.TimeoutException):
+            return "A requisição para a API do Ollama expirou (timeout). O modelo pode estar carregando na memória ou o servidor está sobrecarregado."
+        if isinstance(exc, httpx.ConnectError):
+            return "Não foi possível conectar ao Ollama. Certifique-se de que o Ollama está em execução (ex: 'ollama serve')."
+        
         error = getattr(exc, "error", None)
         status = getattr(exc, "status_code", None)
         if error and status:
-            return f"{error} (status code: {status})"
+            if "not found" in str(error).lower() or "not loaded" in str(error).lower():
+                return f"O modelo do Ollama não foi encontrado ou não pôde ser carregado: {error} (código de status: {status})"
+            return f"{error} (código de status: {status})"
         if error:
             return str(error)
-        if str(exc):
-            return str(exc)
+        
+        exc_str = str(exc)
+        if "connect" in exc_str.lower():
+            return "Não foi possível conectar ao Ollama. Certifique-se de que o Ollama está em execução."
+        if "timeout" in exc_str.lower():
+            return "A requisição para a API do Ollama expirou. O modelo pode estar sendo carregado."
+            
+        if exc_str:
+            return exc_str
         return exc.__class__.__name__
 
     async def health(self) -> dict:
@@ -73,12 +88,13 @@ class OllamaService:
             {
                 "role": "system",
                 "content": (
-                    "You are a rigorous, cinematic Dungeon Master for a local D&D web game. "
-                    "Keep scenes playable, concise, and reactive. Respect player agency. "
-                    "Do not invent dice totals; the app handles dice. Avoid markdown headings "
-                    "and long decorative formatting. Keep the total response under 1000 "
-                    "characters and 200 words. End every response with exactly one "
-                    "Choices: section containing 2-4 numbered actionable options."
+                    "Você é um Mestre (Dungeon Master) rigoroso e cinematográfico para um jogo de D&D. "
+                    "Narrem e gerenciem o jogo exclusivamente em português do Brasil. "
+                    "Mantenha as cenas jogáveis, concisas e reativas. Respeite a agência e as ações do jogador. "
+                    "Não invente resultados de dados; o aplicativo lida com isso. Evite cabeçalhos markdown "
+                    "e formatações decorativas longas. Mantenha a resposta total abaixo de 1000 caracteres "
+                    "e 200 palavras. Termine cada resposta com exatamente uma seção Escolhas: contendo de "
+                    "2 a 4 opções numeradas de ações jogáveis."
                 ),
             },
             {"role": "user", "content": prompt},

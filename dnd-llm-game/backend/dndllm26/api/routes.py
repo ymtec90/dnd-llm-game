@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
 from dndllm26.core.settings import get_settings
-from dndllm26.db.models import Campaign, Hero, LoreDocument, PendingRoll, now_utc
+from dndllm26.db.models import Campaign, Hero, LoreDocument, PendingRoll, now_utc, GameSession, CharacterStatus, CampaignMessage
 from dndllm26.db.session import get_session
 from dndllm26.game.service import (
     add_character,
@@ -16,6 +16,7 @@ from dndllm26.game.service import (
     build_roll_resolution_prompt,
     build_dm_prompt,
     clone_hero_to_campaign,
+    generate_ai_companions,
     create_pending_roll,
     create_campaign,
     decide_roll,
@@ -31,6 +32,10 @@ from dndllm26.game.service import (
     trim_dm_text,
     update_world_from_dm_response,
     choices_from_state,
+    create_game_session,
+    delete_game_session,
+    add_session_message,
+    extract_status_updates,
 )
 from dndllm26.llm.ollama_client import ollama_service
 from dndllm26.rag.store import rag_store
@@ -54,7 +59,11 @@ def sse_json(event: str, payload: dict[str, Any]) -> str:
 def register_uploaded_pdfs(session: Session) -> list[LoreDocument]:
     settings = get_settings()
     documents: list[LoreDocument] = []
-    for path in sorted(settings.upload_dir.glob("*.pdf")):
+    allowed_patterns = ["*.pdf", "*.txt"]
+    paths = []
+    for pattern in allowed_patterns:
+        paths.extend(settings.upload_dir.glob(pattern))
+    for path in sorted(paths, key=lambda p: p.name):
         existing = session.exec(
             select(LoreDocument).where(LoreDocument.filename == path.name)
         ).first()
@@ -80,7 +89,7 @@ async def index_lore_document(document_id: int) -> None:
         path = settings.upload_dir / record.filename
         if not path.exists():
             record.status = "error"
-            record.error = "Uploaded PDF is missing from disk."
+            record.error = "Uploaded file is missing from disk."
             job_session.add(record)
             job_session.commit()
             return
@@ -89,7 +98,7 @@ async def index_lore_document(document_id: int) -> None:
             record.error = None
             job_session.add(record)
             job_session.commit()
-            chunks = await rag_store.index_pdf(path, document_id)
+            chunks = await rag_store.index_document(path, document_id)
             record.status = "ready"
             record.chunks = chunks
         except Exception as exc:
@@ -111,6 +120,8 @@ class CampaignCreate(BaseModel):
     tone: str = "dangerous heroic fantasy"
     hero_ids: list[int] = Field(default_factory=list)
     lore_document_ids: list[int] = Field(default_factory=list)
+    ai_companions_count: int = 0
+    ai_companions_classes: list[str] = Field(default_factory=list)
 
 
 class CharacterCreate(BaseModel):
@@ -219,6 +230,8 @@ async def create(payload: CampaignCreate, session: Session = Depends(get_session
         hero = session.get(Hero, hero_id)
         if hero:
             clone_hero_to_campaign(session, campaign.id, hero)
+    if payload.ai_companions_count > 0:
+        await generate_ai_companions(session, campaign.id, payload.ai_companions_count, payload.ai_companions_classes)
     set_campaign_lore(session, campaign.id, payload.lore_document_ids)
     try:
         intro = await generate_campaign_intro(session, campaign.id)
@@ -550,8 +563,9 @@ async def upload_lore(
     file: UploadFile = File(...),
     session: Session = Depends(get_session),
 ) -> LoreDocument:
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDFs are supported")
+    filename_lower = file.filename.lower()
+    if not (filename_lower.endswith(".pdf") or filename_lower.endswith(".txt")):
+        raise HTTPException(status_code=400, detail="Somente arquivos PDF e TXT são suportados")
     settings = get_settings()
     path = settings.upload_dir / file.filename
     path.write_bytes(await file.read())
@@ -586,3 +600,323 @@ def refresh_lore_index(
         if doc.status in {"queued", "error"} and doc.chunks == 0 and doc.id is not None
     ]
     return {"status": "queued", "queued": queued, "documents": [lore_payload(doc) for doc in docs]}
+
+
+from dndllm26.rag.lore_manager import get_lore_packs, ensure_lore_pack_indexed
+
+@router.get("/lore/packs")
+def list_lore_packs() -> list[dict]:
+    return get_lore_packs()
+
+
+class SessionCreate(BaseModel):
+    campaign_id: int
+    name: str
+    lore_pack: str | None = None
+
+
+@router.post("/sessions")
+async def create_session(payload: SessionCreate, session: Session = Depends(get_session)) -> dict:
+    try:
+        if payload.lore_pack:
+            await ensure_lore_pack_indexed(payload.lore_pack)
+        sess = create_game_session(session, payload.campaign_id, payload.name, payload.lore_pack)
+        return sess.model_dump()
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@router.get("/sessions")
+def list_sessions(session: Session = Depends(get_session)) -> list[dict]:
+    sessions = session.exec(select(GameSession).order_by(GameSession.updated_at.desc())).all()
+    return [s.model_dump() for s in sessions]
+
+
+@router.get("/sessions/{session_id}")
+def session_detail(session_id: int, session: Session = Depends(get_session)) -> dict:
+    game_session = session.get(GameSession, session_id)
+    if not game_session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    campaign = session.get(Campaign, game_session.campaign_id)
+    characters = session.exec(
+        select(CharacterStatus).where(CharacterStatus.game_session_id == session_id)
+    ).all()
+    
+    messages = session.exec(
+        select(CampaignMessage).where(CampaignMessage.game_session_id == session_id).order_by(CampaignMessage.created_at)
+    ).all()
+    
+    turns = [
+        {
+            "id": msg.id,
+            "campaign_id": game_session.campaign_id,
+            "speaker": msg.speaker,
+            "content": msg.content,
+            "created_at": msg.created_at
+        }
+        for msg in messages
+    ]
+    
+    pending = get_pending_roll(session, game_session.campaign_id)
+    
+    return {
+        "session": game_session.model_dump(),
+        "campaign": campaign.model_dump() if campaign else None,
+        "characters": [c.model_dump() for c in characters],
+        "turns": turns,
+        "choices": choices_from_state(game_session),
+        "pending_roll": pending_roll_payload(pending) if pending else None
+    }
+
+
+@router.delete("/sessions/{session_id}")
+def remove_session(session_id: int, session: Session = Depends(get_session)) -> dict:
+    try:
+        delete_game_session(session, session_id)
+        return {"status": "deleted", "id": session_id}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@router.post("/sessions/{session_id}/actions/stream")
+async def stream_session_action(
+    session_id: int,
+    payload: PlayerAction,
+    session: Session = Depends(get_session),
+):
+    game_session = session.get(GameSession, session_id)
+    if not game_session:
+        raise HTTPException(status_code=404, detail="Session not found")
+        
+    campaign_id = game_session.campaign_id
+    if get_pending_roll(session, campaign_id):
+        raise HTTPException(status_code=409, detail="Resolve the pending dice roll first.")
+
+    action = payload.content.strip()
+    if not action:
+        raise HTTPException(status_code=400, detail="Action cannot be empty.")
+        
+    add_session_message(session, session_id, "Player", action)
+    add_event(session, campaign_id, "player_action", {"content": action, "session_id": session_id})
+
+    decision = await decide_roll(session, campaign_id, action, game_session_id=session_id)
+    if decision["requires_roll"]:
+        pending = create_pending_roll(session, campaign_id, action, decision)
+
+        async def roll_required_stream():
+            if pending.narration:
+                yield sse_json("narration", {"content": pending.narration})
+            yield sse_json("roll_required", pending_roll_payload(pending))
+            yield sse_json("done", {"status": "roll_required"})
+
+        return StreamingResponse(roll_required_stream(), media_type="text/event-stream")
+
+    prompt = await build_dm_prompt(session, campaign_id, action, game_session_id=session_id)
+
+    async def event_stream():
+        parts: list[str] = []
+        yield sse_json("phase", {"status": "dm_streaming"})
+        try:
+            async for token in ollama_service.stream_dm(prompt):
+                if sum(len(part) for part in parts) >= 1000:
+                    break
+                remaining = 1000 - sum(len(part) for part in parts)
+                token = token[:remaining]
+                parts.append(token)
+                yield sse_json("narration_delta", {"content": token})
+        except Exception as exc:
+            message = (
+                "[Local LLM error] "
+                f"{ollama_service.error_message(exc)}. "
+                "Check that Ollama is running and the configured chat model is pulled."
+            )
+            parts.append(message)
+            yield sse_json("error", {"message": message})
+            
+        dm_text = trim_dm_text("".join(parts))
+        if dm_text:
+            from dndllm26.db.session import engine
+            with Session(engine) as write_session:
+                add_session_message(write_session, session_id, "DM", dm_text)
+                yield sse_json("phase", {"status": "utility_analyzing"})
+                add_event(write_session, campaign_id, "dm_response", {"content": dm_text, "session_id": session_id})
+                state = await update_world_from_dm_response(write_session, campaign_id, dm_text, game_session_id=session_id)
+                yield sse_json(
+                    "choices_updated",
+                    {
+                        "choices": choices_from_state(state),
+                        "location": state.current_location,
+                        "objective": state.active_objective,
+                        "summary": state.scene_summary,
+                    },
+                )
+                try:
+                    updates = await extract_status_updates(write_session, campaign_id, dm_text, game_session_id=session_id)
+                    if updates:
+                        yield sse_json("status_updates", {"updates": updates})
+                except Exception as exc:
+                    print("Status updates extraction failed:", exc)
+        yield sse_json("done", {"status": "complete"})
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@router.post("/sessions/{session_id}/rolls/{pending_roll_id}/resolve/stream")
+async def resolve_session_roll_stream(
+    session_id: int,
+    pending_roll_id: int,
+    session: Session = Depends(get_session),
+):
+    game_session = session.get(GameSession, session_id)
+    if not game_session:
+        raise HTTPException(status_code=404, detail="Session not found")
+        
+    campaign_id = game_session.campaign_id
+    pending = session.get(PendingRoll, pending_roll_id)
+    if not pending or pending.campaign_id != campaign_id:
+        raise HTTPException(status_code=404, detail="Pending roll not found")
+        
+    try:
+        roll = perform_pending_roll(session, campaign_id, pending_roll_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    roll_text = (
+        f"{pending.ability}{f' ({pending.skill})' if pending.skill else ''}: "
+        f"{roll.formula} -> {roll.rolls_json}"
+        f"{f' + {roll.modifier}' if roll.modifier > 0 else ''}"
+        f" = {roll.total} vs DC {pending.dc}: {roll.outcome}"
+    )
+    add_session_message(session, session_id, "Roll", roll_text)
+
+    prompt = await build_roll_resolution_prompt(session, campaign_id, pending, roll, game_session_id=session_id)
+
+    async def event_stream():
+        parts: list[str] = []
+        yield sse_json(
+            "roll_result",
+            {
+                "pending_roll_id": pending.id,
+                "formula": roll.formula,
+                "rolls": json.loads(roll.rolls_json),
+                "modifier": roll.modifier,
+                "total": roll.total,
+                "dc": roll.dc,
+                "outcome": roll.outcome,
+                "reason": roll.reason,
+            },
+        )
+        try:
+            async for token in ollama_service.stream_dm(prompt):
+                if sum(len(part) for part in parts) >= 1000:
+                    break
+                remaining = 1000 - sum(len(part) for part in parts)
+                token = token[:remaining]
+                parts.append(token)
+                yield sse_json("narration_delta", {"content": token})
+        except Exception as exc:
+            message = (
+                "[Local LLM error] "
+                f"{ollama_service.error_message(exc)}. "
+                "The dice result was stored, but the DM response failed."
+            )
+            parts.append(message)
+            yield sse_json("error", {"message": message})
+            
+        dm_text = trim_dm_text("".join(parts))
+        if dm_text:
+            from dndllm26.db.session import engine
+            with Session(engine) as write_session:
+                add_session_message(write_session, session_id, "DM", dm_text)
+                yield sse_json("phase", {"status": "utility_analyzing"})
+                add_event(write_session, campaign_id, "dm_response", {"content": dm_text, "session_id": session_id})
+                state = await update_world_from_dm_response(write_session, campaign_id, dm_text, game_session_id=session_id)
+                yield sse_json(
+                    "choices_updated",
+                    {
+                        "choices": choices_from_state(state),
+                        "location": state.current_location,
+                        "objective": state.active_objective,
+                        "summary": state.scene_summary,
+                    },
+                )
+                try:
+                    updates = await extract_status_updates(write_session, campaign_id, dm_text, game_session_id=session_id)
+                    if updates:
+                        yield sse_json("status_updates", {"updates": updates})
+                except Exception as exc:
+                    print("Status updates extraction failed:", exc)
+        yield sse_json("done", {"status": "complete"})
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+class ItemUsePayload(BaseModel):
+    character_id: int
+    item_id: str
+
+
+@router.post("/sessions/{session_id}/items/use")
+def use_session_item(
+    session_id: int,
+    payload: ItemUsePayload,
+    session: Session = Depends(get_session)
+) -> dict:
+    game_session = session.get(GameSession, session_id)
+    if not game_session:
+        raise HTTPException(status_code=404, detail="Session not found")
+        
+    char_status = session.exec(
+        select(CharacterStatus)
+        .where(CharacterStatus.game_session_id == session_id)
+        .where(CharacterStatus.character_id == payload.character_id)
+    ).first()
+    
+    if not char_status:
+        raise HTTPException(status_code=404, detail="Character not found in this session")
+        
+    try:
+        inventory = json.loads(char_status.inventory)
+        if not isinstance(inventory, list):
+            inventory = []
+    except:
+        inventory = []
+        
+    item_idx = -1
+    for idx, item in enumerate(inventory):
+        if item.get("id") == payload.item_id:
+            item_idx = idx
+            break
+            
+    if item_idx == -1:
+        raise HTTPException(status_code=404, detail="Item not found in inventory")
+        
+    used_item = inventory.pop(item_idx)
+    char_status.inventory = json.dumps(inventory)
+    
+    effect = used_item.get("effect", "").lower()
+    healing = 0
+    import re
+    if "hp" in effect or "cura" in effect:
+        digits = re.findall(r"\d+", effect)
+        if digits:
+            healing = int(digits[0])
+            char_status.hp = min(char_status.max_hp, char_status.hp + healing)
+            
+    session.add(char_status)
+    
+    message_text = f"O jogador usou {used_item.get('name')}"
+    if healing > 0:
+        message_text += f" (curando {healing} HP)"
+        
+    add_session_message(session, session_id, "System", message_text)
+    session.commit()
+    session.refresh(char_status)
+    
+    return {
+        "status": "success",
+        "used_item": used_item,
+        "healing_applied": healing,
+        "character": char_status.model_dump()
+    }

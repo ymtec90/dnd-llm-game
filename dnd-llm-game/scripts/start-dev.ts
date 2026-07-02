@@ -1,3 +1,4 @@
+import { existsSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -12,16 +13,46 @@ const venvPython = isWindows
   : join(root, ".venv", "bin", "python");
 
 function canRun(cmd: string[]): boolean {
-  const probe = Bun.spawnSync({
-    cmd,
-    stdout: "ignore",
-    stderr: "ignore"
-  });
-  return probe.exitCode === 0;
+  try {
+    const probe = Bun.spawnSync({
+      cmd,
+      stdout: "ignore",
+      stderr: "ignore"
+    });
+    return probe.exitCode === 0;
+  } catch {
+    return false;
+  }
 }
 
 function commandExists(command: string): boolean {
-  return canRun(isWindows ? ["where", command] : ["sh", "-lc", `command -v ${command}`]);
+  if (isWindows) {
+    if (canRun(["where", command])) return true;
+  } else {
+    if (canRun(["which", command])) return true;
+  }
+
+  // Fallback: manually check PATH directories
+  const pathEnv = process.env.PATH || "";
+  const sep = isWindows ? ";" : ":";
+  const dirs = pathEnv.split(sep);
+  for (const dir of dirs) {
+    const filePath = join(dir, command);
+    const winFilePath = join(dir, `${command}.exe`);
+    try {
+      if (existsSync(filePath) && statSync(filePath).isFile()) return true;
+      if (isWindows && existsSync(winFilePath) && statSync(winFilePath).isFile()) return true;
+    } catch {
+      // ignore
+    }
+  }
+
+  if (command === "bun") {
+    // If this script is running under bun, bun is definitely available
+    return true;
+  }
+
+  return false;
 }
 
 function findPython(): string[] {

@@ -16,6 +16,9 @@ from dndllm26.db.models import (
     Turn,
     WorldState,
     now_utc,
+    GameSession,
+    CharacterStatus,
+    CampaignMessage,
 )
 from dndllm26.game.dice import normalize_formula, outcome_for, roll_formula
 from dndllm26.llm.ollama_client import ollama_service
@@ -33,19 +36,19 @@ def create_campaign(session: Session, title: str, setting: str, tone: str) -> Ca
     intro = Turn(
         campaign_id=campaign.id,
         speaker="System",
-        content=f"Campaign created. Setting: {setting} Tone: {tone}",
+        content=f"Campanha criada. Cenário: {setting} Tom: {tone}",
     )
     session.add(intro)
     state = WorldState(
         campaign_id=campaign.id,
-        current_location="Campaign opening",
-        active_objective="Establish the first scene.",
-        scene_summary=f"{setting} Tone: {tone}",
+        current_location="Abertura da campanha",
+        active_objective="Estabelecer a primeira cena.",
+        scene_summary=f"{setting} Tom: {tone}",
         choices_json=json.dumps(
             [
-                "Look for work or rumors.",
-                "Find a safe place to rest.",
-                "Study the local trouble.",
+                "Procurar trabalho ou boatos.",
+                "Encontrar um lugar seguro para descansar.",
+                "Estudar os problemas locais.",
             ]
         ),
     )
@@ -115,6 +118,52 @@ def clone_hero_to_campaign(session: Session, campaign_id: int, hero: Hero) -> Ch
     )
 
 
+async def generate_ai_companions(session: Session, campaign_id: int, count: int, classes: list[str]) -> list[Character]:
+    companions = []
+    import random
+    ancestries_pool = ["Anão", "Elfo", "Humano", "Halfling", "Meio-Elfo", "Meio-Orc"]
+    names_pool = ["Tharivol", "Keth", "Valerie", "Grom", "Bryn", "Lia", "Kaelen", "Dorn", "Sariel", "Tordek"]
+    backstory_pool = [
+        "Um guerreiro experiente que busca glória e ouro nas masmorras.",
+        "Um andarilho misterioso com um passado sombrio e segredos guardados.",
+        "Um erudito devoto à busca de relíquias arcanas perdidas.",
+        "Um sobrevivente cínico que faz qualquer coisa por algumas moedas.",
+    ]
+    
+    for i in range(count):
+        char_class = classes[i] if i < len(classes) else random.choice(["Guerreiro", "Mago", "Clérigo", "Ladino"])
+        
+        system = "Você é um gerador de personagens de D&D 5e em português. Retorne apenas JSON."
+        user = f"Gere um companheiro de aventura de classe {char_class}. Retorne JSON com: name (nome curto de fantasia), ancestry (raça), backstory (antecedentes e motivação de 1 frase em português)."
+        fallback = {
+            "name": f"{random.choice(names_pool)}",
+            "ancestry": random.choice(ancestries_pool),
+            "backstory": random.choice(backstory_pool)
+        }
+        
+        try:
+            generated = await ollama_service.chat_json(system, user, fallback)
+        except Exception:
+            generated = fallback
+            
+        name = str(generated.get("name") or fallback["name"])
+        ancestry = str(generated.get("ancestry") or fallback["ancestry"])
+        backstory = str(generated.get("backstory") or fallback["backstory"])
+        
+        char = add_character(
+            session=session,
+            campaign_id=campaign_id,
+            name=name,
+            ancestry=ancestry,
+            character_class=char_class,
+            backstory=backstory,
+            inventory=["Rações", "Tocha", "Cantil"],
+            is_human=False,
+        )
+        companions.append(char)
+    return companions
+
+
 def trim_dm_text(text: str) -> str:
     clean = "\n".join(line.strip() for line in text.replace("\r\n", "\n").splitlines())
     clean = re.sub(r"\n{3,}", "\n\n", clean).strip()
@@ -160,10 +209,22 @@ def strip_dm_meta_output(text: str) -> str:
 async def generate_campaign_intro(session: Session, campaign_id: int) -> str:
     campaign = session.get(Campaign, campaign_id)
     characters = get_characters(session, campaign_id)
-    party = "\n".join(
-        f"- {char.name}, {char.ancestry} {char.character_class}: {char.backstory}"
-        for char in characters
-    )
+    
+    # Separate player characters from NPC/AI characters
+    human_characters = [c for c in characters if c.is_human]
+    ai_characters = [c for c in characters if not c.is_human]
+    
+    party = []
+    if human_characters:
+        party.append("Jogador Humano:")
+        for char in human_characters:
+            party.append(f"- {char.name}, {char.ancestry} {char.character_class}: {char.backstory}")
+    if ai_characters:
+        party.append("Companheiros de Grupo controlados por você (IA):")
+        for char in ai_characters:
+            party.append(f"- {char.name}, {char.ancestry} {char.character_class}: {char.backstory}")
+    party_text = "\n".join(party)
+
     lore = await rag_store.search(
         f"{campaign.title if campaign else campaign_id}\n{campaign.setting if campaign else ''}",
         limit=4,
@@ -173,28 +234,30 @@ async def generate_campaign_intro(session: Session, campaign_id: int) -> str:
         f"[{item['filename']}#{item['chunk_index']}] {item['text']}" for item in lore
     )
     system = (
-        "You are the main Dungeon Master for a local D&D web game. Create the opening "
-        "scene from the campaign brief. Output only the in-world DM message that the "
-        "player sees. Never say 'here is', 'possible', 'this message establishes', or "
-        "explain your writing. Be concrete, playable, and concise. Do not use markdown "
-        "headings. Do not invent dice results. End with exactly one Choices: section "
-        "containing 2-4 numbered player actions."
+        "Você é o Mestre (DM) de um jogo de D&D. Crie a cena de abertura com base no briefing. "
+        "Escreva sua narração e diálogos exclusivamente em português do Brasil. "
+        "Você deve gerar apenas a mensagem do Mestre em primeira pessoa que o jogador verá. "
+        "Nunca diga 'aqui está', 'possível', 'esta mensagem estabelece' ou explique sua escrita. "
+        "Seja concreto, jogável e conciso. Não use cabeçalhos markdown. Não invente resultados de dados. "
+        "Se houver companheiros de grupo da IA listados, você controla as ações e falas deles também. "
+        "Separe claramente a narração do Mestre das ações/falas desses companheiros, identificando-os explicitamente (ex: [Nome do Companheiro]: 'Fala...'). "
+        "Termine com exatamente uma seção Escolhas: contendo de 2 a 4 opções numeradas de ações para o jogador."
     )
     user = f"""
-Campaign title: {campaign.title if campaign else campaign_id}
-Setting: {campaign.setting if campaign else ""}
-Tone: {campaign.tone if campaign else ""}
+Título da campanha: {campaign.title if campaign else campaign_id}
+Cenário: {campaign.setting if campaign else ""}
+Tom: {campaign.tone if campaign else ""}
 
-Selected heroes:
-{party or "No selected heroes."}
+Grupo:
+{party_text or "Nenhum herói selecionado."}
 
-Relevant indexed lore:
-{lore_text or "No retrieved lore."}
+Histórico (Lore) relevante:
+{lore_text or "Nenhum histórico disponível."}
 
-Write the first DM message for the campaign. It must establish where the heroes are,
-what immediate tension is visible, and what they can do next.
-Do not describe the message, analyze it, or wrap it in quotes. Start directly with the scene.
-Hard limits: under {MAX_DM_CHARS} characters and under {MAX_DM_WORDS} words total.
+Escreva a primeira mensagem do Mestre para a campanha. Ela deve estabelecer onde os heróis estão, qual tensão imediata está visível e o que eles podem fazer a seguir.
+Não descreva a mensagem, não a analise nem a envolva em aspas. Comece diretamente com a cena.
+Limites estritos: menos de {MAX_DM_CHARS} caracteres e menos de {MAX_DM_WORDS} palavras no total.
+Escreva tudo exclusivamente em português do Brasil.
 """.strip()
     intro = await ollama_service.chat_text(
         system,
@@ -365,63 +428,126 @@ def get_pending_roll(session: Session, campaign_id: int) -> PendingRoll | None:
     ).first()
 
 
-async def build_dm_prompt(session: Session, campaign_id: int, action: str) -> str:
+async def build_dm_prompt(session: Session, campaign_id: int, action: str, game_session_id: int | None = None) -> str:
     campaign = session.get(Campaign, campaign_id)
-    turns = get_turns(session, campaign_id)[-10:]
-    characters = get_characters(session, campaign_id)
-    recent = "\n".join(f"{turn.speaker}: {turn.content}" for turn in turns)
-    party = "\n".join(
-        f"- {char.name}, {char.ancestry} {char.character_class}: {char.backstory}"
-        for char in characters
-    )
-    lore = await rag_store.search(
-        action + "\n" + recent,
-        limit=4,
-        document_ids=get_campaign_lore_ids(session, campaign_id),
-    )
+    if game_session_id:
+        msg_turns = session.exec(
+            select(CampaignMessage)
+            .where(CampaignMessage.game_session_id == game_session_id)
+            .order_by(CampaignMessage.created_at)
+        ).all()[-10:]
+        recent = "\n".join(f"{turn.speaker}: {turn.content}" for turn in msg_turns)
+        characters = session.exec(
+            select(CharacterStatus)
+            .where(CharacterStatus.game_session_id == game_session_id)
+        ).all()
+    else:
+        turns = get_turns(session, campaign_id)[-10:]
+        recent = "\n".join(f"{turn.speaker}: {turn.content}" for turn in turns)
+        characters = get_characters(session, campaign_id)
+    
+    # Separate player characters from NPC/AI characters
+    human_characters = [c for c in characters if c.is_human]
+    ai_characters = [c for c in characters if not c.is_human]
+    
+    party = []
+    if human_characters:
+        party.append("Jogador Humano:")
+        for char in human_characters:
+            party.append(f"- {char.name}, {char.ancestry} {char.character_class}: {char.backstory}")
+    if ai_characters:
+        party.append("Companheiros de Grupo controlados por você (IA):")
+        for char in ai_characters:
+            party.append(f"- {char.name}, {char.ancestry} {char.character_class}: {char.backstory}")
+    party_text = "\n".join(party)
+
+    lore_pack = None
+    tone_override = None
+    if game_session_id:
+        game_session = session.get(GameSession, game_session_id)
+        if game_session and game_session.lore_pack:
+            from dndllm26.rag.lore_manager import LORE_PACKS
+            lore_pack = game_session.lore_pack
+            if lore_pack in LORE_PACKS:
+                tone_override = LORE_PACKS[lore_pack]["tone_prompt"]
+
+    if lore_pack:
+        lore = await rag_store.search(
+            action + "\n" + recent,
+            limit=4,
+            lore_pack=lore_pack,
+        )
+    else:
+        lore = await rag_store.search(
+            action + "\n" + recent,
+            limit=4,
+            document_ids=get_campaign_lore_ids(session, campaign_id),
+        )
+        
     lore_text = "\n".join(
         f"[{item['filename']}#{item['chunk_index']}] {item['text']}" for item in lore
     )
+    
+    tone_str = tone_override or (campaign.tone if campaign else "")
+    setting_str = (LORE_PACKS[lore_pack]["name"] if (lore_pack and lore_pack in LORE_PACKS) else (campaign.setting if campaign else ""))
+
     return f"""
-Campaign: {campaign.title if campaign else campaign_id}
-Setting: {campaign.setting if campaign else ""}
-Tone: {campaign.tone if campaign else ""}
+Campanha: {campaign.title if campaign else campaign_id}
+Cenário: {setting_str}
+Tom: {tone_str}
 
-Party:
-{party or "No party members have been added yet."}
+Grupo:
+{party_text or "Nenhum membro do grupo foi adicionado ainda."}
 
-Recent turns:
+Turnos recentes:
 {recent}
 
-Relevant local lore:
-{lore_text or "No retrieved lore."}
+Histórico local relevante:
+{lore_text or "Nenhum histórico recuperado."}
 
-Selected campaign references:
-{available_lore_documents(session, campaign_id) or "No campaign lore selected. Use D&D 5e-style rulings."}
+Referências de campanha selecionadas:
+{available_lore_documents(session, campaign_id) or "Nenhuma lore de campanha selecionada. Use regras do estilo D&D 5e."}
 
-Player action:
+Ação do jogador:
 {action}
 
-Continue the scene. Include any needed ability check or consequence.
-Write 120-180 words and stay under 1000 characters. Avoid markdown headings, bold markers, and separators.
-Output only the DM narration and Choices section. Do not explain what your response does.
-End with a Choices section containing 2-4 numbered options that are specific to the
-current scene, named NPCs, locations, threats, or clues. Each choice must be a
-playable action written in one sentence. Do not copy instructions or use generic
-placeholder wording.
+Continue a cena em português do Brasil. Inclua qualquer teste de atributo ou consequência necessária.
+Se houver companheiros de grupo da IA listados, você controla as ações e diálogos deles. Separe claramente a narrativa do Mestre das falas e ações desses companheiros (ex: [Nome do Companheiro]: 'Fala...').
+Escreva entre 120 e 180 palavras e mantenha-se abaixo de 1000 caracteres. Evite cabeçalhos markdown, marcadores em negrito e separadores.
+Retorne apenas a narração do Mestre (e falas/ações dos companheiros) e a seção Escolhas. Não explique o que sua resposta faz.
+Escreva tudo exclusivamente em português do Brasil.
+Termine com uma seção Escolhas contendo de 2 a 4 opções numeradas que sejam específicas para a cena atual, NPCs nomeados, ameaças ou pistas. Cada escolha deve ser uma ação jogável escrita em uma única frase. Não copie instruções ou use termos genéricos.
 """.strip()
 
 
-def _context_block(session: Session, campaign_id: int) -> str:
+def _context_block(session: Session, campaign_id: int, game_session_id: int | None = None) -> str:
     campaign = session.get(Campaign, campaign_id)
-    state = get_world_state(session, campaign_id)
-    turns = get_turns(session, campaign_id)[-12:]
-    characters = get_characters(session, campaign_id)
-    party = "\n".join(
-        f"- {char.name}: {char.ancestry} {char.character_class}. {char.backstory}"
-        for char in characters
-    )
-    recent = "\n".join(f"{turn.speaker}: {turn.content}" for turn in turns)
+    if game_session_id:
+        state = session.get(GameSession, game_session_id)
+        msg_turns = session.exec(
+            select(CampaignMessage)
+            .where(CampaignMessage.game_session_id == game_session_id)
+            .order_by(CampaignMessage.created_at)
+        ).all()[-12:]
+        char_statuses = session.exec(
+            select(CharacterStatus)
+            .where(CharacterStatus.game_session_id == game_session_id)
+        ).all()
+        party = "\n".join(
+            f"- {char.name}: {char.ancestry} {char.character_class}. {char.backstory}"
+            for char in char_statuses
+        )
+        recent = "\n".join(f"{turn.speaker}: {turn.content}" for turn in msg_turns)
+    else:
+        state = get_world_state(session, campaign_id)
+        turns = get_turns(session, campaign_id)[-12:]
+        characters = get_characters(session, campaign_id)
+        party = "\n".join(
+            f"- {char.name}: {char.ancestry} {char.character_class}. {char.backstory}"
+            for char in characters
+        )
+        recent = "\n".join(f"{turn.speaker}: {turn.content}" for turn in turns)
+        
     return f"""
 Campaign: {campaign.title if campaign else campaign_id}
 Setting: {campaign.setting if campaign else ""}
@@ -513,13 +639,18 @@ async def update_world_from_dm_response(
     session: Session,
     campaign_id: int,
     dm_text: str,
-) -> WorldState:
-    state = get_world_state(session, campaign_id)
+    game_session_id: int | None = None,
+) -> WorldState | GameSession:
+    if game_session_id:
+        state = session.get(GameSession, game_session_id)
+    else:
+        state = get_world_state(session, campaign_id)
+        
     choices = extract_choices(dm_text)
     fallback_choices = choices or choices_from_state(state) or [
-        "Ask a follow-up question.",
-        "Inspect the area.",
-        "Move carefully onward.",
+        "Fazer uma pergunta de acompanhamento.",
+        "Inspecionar a área.",
+        "Seguir adiante com cuidado.",
     ]
     fallback = {
         "location": state.current_location,
@@ -529,30 +660,30 @@ async def update_world_from_dm_response(
     }
     extracted = await ollama_service.chat_json(
         (
-            "You are the utility model for a D&D web app. The main DM model writes "
-            "narration; your job is to convert it into compact UI state and dynamic "
-            "player actions. Return only valid JSON and do not continue the story."
+            "Você é o modelo utilitário para um aplicativo web de D&D. O modelo principal do Mestre escreve "
+            "a narração; seu trabalho é convertê-la em um estado de UI compacto e ações dinâmicas para o jogador. "
+            "Retorne apenas JSON válido e não continue a história."
         ),
         f"""
-DM narration:
+Narração do Mestre (DM):
 {dm_text}
 
-Return JSON:
-location: concrete current place, 2-6 words
-objective: immediate active goal, 4-14 words
-summary: one sentence summary of the current scene
-choices: array of 2-4 strings, not objects. Each string is one concise,
-scene-specific player action under 90 characters
+Retorne um JSON com os seguintes campos em português do Brasil:
+location: local atual concreto, 2 a 6 palavras
+objective: objetivo ativo imediato, 4 a 14 palavras
+summary: resumo de uma frase da cena atual
+choices: array de 2 a 4 strings (não objetos). Cada string deve ser uma ação concisa do jogador específica para a cena, com menos de 90 caracteres
 
-Choice rules:
-- Use concrete nouns from the scene when possible.
-- Include a mix of investigation, social, travel, or risk-taking options when relevant.
-- Do not ask for dice rolls in the choice text; the rules referee decides rolls separately.
-- Do not invent outcomes, rewards, or success.
-- Do not return objects such as {{"action": "..."}}, only plain strings.
+Regras de escolha:
+- Use substantivos concretos da cena quando possível.
+- Inclua uma mistura de opções de investigação, social, viagem ou risco quando relevante.
+- Não peça rolagens de dados no texto da escolha.
+- Não invente resultados, recompensas ou sucesso.
+- Não retorne objetos como {{"action": "..."}}, apenas strings normais.
+- Escreva tudo em português do Brasil.
 
-Do not use labels or placeholders such as "short current location",
-"current immediate objective", "one sentence scene summary", or "specific playable action".
+Não use rótulos ou marcadores como "localização atual curta",
+"objetivo imediato ativo", "resumo da cena de uma frase" ou "ação específica jogável".
 """.strip(),
         fallback,
     )
@@ -563,13 +694,13 @@ Do not use labels or placeholders such as "short current location",
         extracted.get("location"),
         state.current_location,
         120,
-        "Unknown location",
+        "Local desconhecido",
     )
     state.active_objective = clean_extracted_text(
         extracted.get("objective"),
         state.active_objective,
         180,
-        "Choose the next move.",
+        "Escolha o próximo movimento.",
     )
     fallback_summary = " ".join(format_summary_source(dm_text).split()[:42])
     summary = extracted.get("summary") or fallback_summary or state.scene_summary
@@ -577,7 +708,7 @@ Do not use labels or placeholders such as "short current location",
         summary,
         fallback_summary or state.scene_summary,
         260,
-        "The scene is unfolding.",
+        "A cena está se desenrolando.",
     )
 
     if choices:
@@ -608,12 +739,12 @@ def format_summary_source(text: str) -> str:
 def _fallback_roll_decision(action: str) -> dict[str, Any]:
     lower = action.lower()
     checks = [
-        (("sneak", "hide", "stealth"), "Dexterity", "Stealth", 13),
-        (("persuade", "convince", "lie", "deceive", "rumor"), "Charisma", "Persuasion", 12),
-        (("search", "inspect", "investigate", "study"), "Intelligence", "Investigation", 12),
-        (("listen", "notice", "watch", "spot"), "Wisdom", "Perception", 12),
-        (("climb", "force", "break", "lift"), "Strength", "Athletics", 13),
-        (("attack", "strike", "shoot", "stab"), "Strength or Dexterity", "Attack", 12),
+        (("sneak", "hide", "stealth", "furtivo", "esconder", "furtividade"), "Destreza", "Furtividade", 13),
+        (("persuade", "convince", "lie", "deceive", "rumor", "persuadir", "convencer", "mentir", "enganar", "boato"), "Carisma", "Persuasão", 12),
+        (("search", "inspect", "investigate", "study", "procurar", "inspecionar", "investigar", "estudar"), "Inteligência", "Investigação", 12),
+        (("listen", "notice", "watch", "spot", "ouvir", "notar", "observar", "perceber"), "Sabedoria", "Percepção", 12),
+        (("climb", "force", "break", "lift", "escalar", "forçar", "quebrar", "levantar"), "Força", "Atletismo", 13),
+        (("attack", "strike", "shoot", "stab", "atacar", "golpear", "atirar", "esfaquear"), "Força ou Destreza", "Ataque", 12),
     ]
     for words, ability, skill, dc in checks:
         if any(word in lower for word in words):
@@ -630,40 +761,40 @@ def _fallback_roll_decision(action: str) -> dict[str, Any]:
         "requires_roll": False,
         "narration": "",
         "formula": "1d20",
-        "ability": "Ability",
+        "ability": "Atributo",
         "skill": None,
         "dc": 10,
         "reason": "",
     }
 
 
-async def decide_roll(session: Session, campaign_id: int, action: str) -> dict[str, Any]:
+async def decide_roll(session: Session, campaign_id: int, action: str, game_session_id: int | None = None) -> dict[str, Any]:
     fallback = _fallback_roll_decision(action)
     system = (
-        "You are the utility rules referee for a D&D web app. The main DM model "
-        "narrates; your job is to decide if the player's action needs a dice check. "
-        "Return only JSON."
+        "Você é o árbitro de regras utilitário para um jogo de D&D. O Mestre principal "
+        "narra; seu trabalho é decidir se a ação do jogador precisa de um teste de dados. "
+        "Retorne apenas JSON."
     )
     user = f"""
-{_context_block(session, campaign_id)}
+{_context_block(session, campaign_id, game_session_id)}
 
-Player action:
+Ação do jogador:
 {action}
 
-Return JSON with:
+Retorne um JSON com os seguintes campos (textos em português do Brasil):
 requires_roll: boolean
-narration: short optional setup text before a roll
-formula: dice formula, usually 1d20 plus a small modifier like 1d20+2
-ability: ability name
-skill: skill or null
-dc: integer 5-25
-reason: why the roll is required
+narration: texto curto opcional de preparação antes da rolagem
+formula: fórmula do dado, geralmente 1d20 mais um modificador pequeno como 1d20+2
+ability: nome do atributo (ex: Força, Destreza, Constituição, Inteligência, Sabedoria, Carisma)
+skill: perícia correspondente (ou null)
+dc: número inteiro de 5 a 25 (Classe de Dificuldade)
+reason: justificativa curta de por que a rolagem é necessária
 
-Require a roll only when failure would create an interesting consequence.
-Do not require a roll for simple navigation, ordinary conversation, or safe actions.
-Use the current character context when choosing the most likely ability and skill.
-The reason and narration must be about this one action only. Do not summarize player choices,
-campaign options, or previous menu text.
+Exija uma rolagem apenas quando a falha criar uma consequência interessante.
+Não exija rolagem para navegação simples, conversas comuns ou ações seguras.
+Use o contexto do personagem atual ao escolher o atributo e a perícia mais prováveis.
+A justificativa (reason) e a narração devem ser apenas sobre esta ação.
+Escreva todos os campos de texto (narration, reason, ability, skill) em português do Brasil.
 """.strip()
     decision = await ollama_service.chat_json(system, user, fallback)
     merged = {**fallback, **decision}
@@ -792,40 +923,324 @@ async def build_roll_resolution_prompt(
     campaign_id: int,
     pending: PendingRoll,
     roll: DiceRoll,
+    game_session_id: int | None = None,
 ) -> str:
-    lore = await rag_store.search(
-        pending.action_text,
-        limit=4,
-        document_ids=get_campaign_lore_ids(session, campaign_id),
-    )
+    lore_pack = None
+    if game_session_id:
+        game_session = session.get(GameSession, game_session_id)
+        if game_session and game_session.lore_pack:
+            lore_pack = game_session.lore_pack
+
+    if lore_pack:
+        lore = await rag_store.search(
+            pending.action_text,
+            limit=4,
+            lore_pack=lore_pack,
+        )
+    else:
+        lore = await rag_store.search(
+            pending.action_text,
+            limit=4,
+            document_ids=get_campaign_lore_ids(session, campaign_id),
+        )
     lore_text = "\n".join(
         f"[{item['filename']}#{item['chunk_index']}] {item['text']}" for item in lore
     )
-    return f"""
-{_context_block(session, campaign_id)}
+    
+    if game_session_id:
+        characters = session.exec(
+            select(CharacterStatus)
+            .where(CharacterStatus.game_session_id == game_session_id)
+        ).all()
+    else:
+        characters = get_characters(session, campaign_id)
+        
+    # Separate player characters from NPC/AI characters
+    human_characters = [c for c in characters if c.is_human]
+    ai_characters = [c for c in characters if not c.is_human]
+    
+    party = []
+    if human_characters:
+        party.append("Jogador Humano:")
+        for char in human_characters:
+            party.append(f"- {char.name}, {char.ancestry} {char.character_class}: {char.backstory}")
+    if ai_characters:
+        party.append("Companheiros de Grupo controlados por você (IA):")
+        for char in ai_characters:
+            party.append(f"- {char.name}, {char.ancestry} {char.character_class}: {char.backstory}")
+    party_text = "\n".join(party)
 
-Player action:
+    return f"""
+{_context_block(session, campaign_id, game_session_id)}
+
+Ação do jogador:
 {pending.action_text}
 
-Required check:
-{pending.ability}{f" ({pending.skill})" if pending.skill else ""}, DC {pending.dc}
-Reason: {pending.reason}
+Teste necessário:
+{pending.ability}{f" ({pending.skill})" if pending.skill else ""}, CD {pending.dc}
+Motivo: {pending.reason}
 
-Dice result:
-Formula: {roll.formula}
-Rolls: {roll.rolls_json}
+Resultado do dado:
+Fórmula: {roll.formula}
+Dados rolados: {roll.rolls_json}
 Total: {roll.total}
-Outcome: {roll.outcome}
+Resultado: {roll.outcome}
 
-Relevant lore:
-{lore_text or "No retrieved lore."}
+Lore relevante:
+{lore_text or "Nenhum histórico recuperado."}
 
-Resolve the action as the Dungeon Master. Reflect the dice result directly.
-On success, reward progress. On failure, add a complication without blocking play.
-Write 120-180 words and stay under 1000 characters. Avoid markdown headings, bold markers, and separators.
-Output only the DM narration and Choices section. Do not explain what your response does.
-End with a Choices section containing 2-4 numbered options that are specific to the
-current scene, named NPCs, locations, threats, or clues. Each choice must be a
-playable action written in one sentence. Do not copy instructions or use generic
-placeholder wording.
+Grupo:
+{party_text or "Nenhum membro do grupo."}
+
+Resolva a ação como o Mestre em português do Brasil. Reflita o resultado do dado diretamente na história.
+Em caso de sucesso, recompense o progresso. Em caso de falha, adicione uma complicação sem bloquear o jogo.
+Se houver companheiros de grupo da IA, você também controla as ações e diálogos deles. Separe claramente a narrativa do Mestre das falas e ações dos companheiros (ex: [Nome do Companheiro]: 'Fala...').
+Escreva entre 120 e 180 palavras e mantenha-se abaixo de 1000 caracteres. Evite cabeçalhos markdown, marcadores em negrito e separadores.
+Retorne apenas a narração do Mestre (e falas/ações dos companheiros) e a seção Escolhas. Não explique o que sua resposta faz.
+Escreva tudo exclusivamente em português do Brasil.
+Termine com uma seção Escolhas contendo de 2 a 4 opções numeradas que sejam específicas para a cena atual, NPCs nomeados, ameaças ou pistas. Cada escolha deve ser uma ação jogável escrita em uma única frase. Não copie instruções ou use termos genéricos.
 """.strip()
+
+
+def add_session_message(session: Session, game_session_id: int, speaker: str, content: str) -> CampaignMessage:
+    msg = CampaignMessage(game_session_id=game_session_id, speaker=speaker, content=content)
+    session.add(msg)
+    
+    # Also update GameSession's updated_at timestamp
+    game_session = session.get(GameSession, game_session_id)
+    if game_session:
+        game_session.updated_at = now_utc()
+        session.add(game_session)
+        
+    session.commit()
+    session.refresh(msg)
+    return msg
+
+
+def create_game_session(session: Session, campaign_id: int, name: str, lore_pack: str | None = None) -> GameSession:
+    campaign = session.get(Campaign, campaign_id)
+    if not campaign:
+        raise ValueError("Campaign not found")
+        
+    world_state = session.exec(
+        select(WorldState).where(WorldState.campaign_id == campaign_id)
+    ).first()
+    
+    current_location = world_state.current_location if world_state else "Abertura da campanha"
+    active_objective = world_state.active_objective if world_state else "Estabelecer a primeira cena."
+    scene_summary = world_state.scene_summary if world_state else ""
+    choices_json = world_state.choices_json if world_state else json.dumps([
+        "Procurar trabalho ou boatos.",
+        "Encontrar um lugar seguro para descansar.",
+        "Estudar os problemas locais.",
+    ])
+    
+    game_session = GameSession(
+        campaign_id=campaign_id,
+        name=name,
+        lore_pack=lore_pack,
+        current_location=current_location,
+        active_objective=active_objective,
+        scene_summary=scene_summary,
+        choices_json=choices_json
+    )
+    session.add(game_session)
+    session.commit()
+    session.refresh(game_session)
+    
+    # Snapshot characters
+    characters = session.exec(
+        select(Character).where(Character.campaign_id == campaign_id)
+    ).all()
+    for char in characters:
+        status = CharacterStatus(
+            game_session_id=game_session.id,
+            character_id=char.id,
+            name=char.name,
+            ancestry=char.ancestry,
+            character_class=char.character_class,
+            backstory=char.backstory,
+            inventory=char.inventory_json,
+            is_human=char.is_human,
+            hp=10,
+            max_hp=10,
+            level=1,
+            xp=0,
+            gold=0
+        )
+        session.add(status)
+        
+    # Snapshot turns
+    turns = session.exec(
+        select(Turn).where(Turn.campaign_id == campaign_id).order_by(Turn.created_at)
+    ).all()
+    for turn in turns:
+        msg = CampaignMessage(
+            game_session_id=game_session.id,
+            speaker=turn.speaker,
+            content=turn.content,
+            created_at=turn.created_at
+        )
+        session.add(msg)
+        
+    session.commit()
+    session.refresh(game_session)
+    return game_session
+
+
+def delete_game_session(session: Session, game_session_id: int) -> None:
+    game_session = session.get(GameSession, game_session_id)
+    if not game_session:
+        raise ValueError("Session not found")
+        
+    characters = session.exec(
+        select(CharacterStatus).where(CharacterStatus.game_session_id == game_session_id)
+    ).all()
+    for char in characters:
+        session.delete(char)
+        
+    messages = session.exec(
+        select(CampaignMessage).where(CampaignMessage.game_session_id == game_session_id)
+    ).all()
+    for msg in messages:
+        session.delete(msg)
+        
+    session.delete(game_session)
+    session.commit()
+
+
+async def extract_status_updates(
+    session: Session,
+    campaign_id: int,
+    dm_text: str,
+    game_session_id: int,
+) -> list[dict]:
+    # We query the utility LLM to parse updates from the narrative
+    characters = session.exec(
+        select(CharacterStatus).where(CharacterStatus.game_session_id == game_session_id)
+    ).all()
+    
+    char_names = ", ".join(c.name for c in characters)
+    
+    system = (
+        "Você é o motor de regras de D&D. Analise a narração do Mestre (DM) "
+        "e identifique se algum personagem recebeu/perdeu XP, ouro, HP ou itens. "
+        "Personagens no grupo: " + char_names + ". Retorne APENAS um objeto JSON."
+    )
+    
+    user = f"""
+Narração do Mestre:
+{dm_text}
+
+Analise a narração e retorne as atualizações de estado do grupo seguindo exatamente este formato JSON:
+{{
+  "character_updates": [
+    {{
+      "name": "Nome do Personagem",
+      "xp_gained": 0,
+      "gold_gained": 0,
+      "hp_change": 0,
+      "items_added": [
+        {{
+          "name": "Nome do Item",
+          "type": "consumable | weapon | armor | utility",
+          "effect": "Descrição curta do efeito (ex: cura 5 HP)"
+        }}
+      ],
+      "items_removed": ["Nome do Item a remover"]
+    }}
+  ]
+}}
+Retorne apenas JSON válido. Se não houver mudanças, retorne um array vazio de character_updates.
+""".strip()
+    
+    fallback = {"character_updates": []}
+    response = await ollama_service.chat_json(system, user, fallback)
+    
+    updates = response.get("character_updates", [])
+    applied_updates = []
+    
+    import uuid
+    for up in updates:
+        name = up.get("name", "")
+        # Find matching character status
+        char_status = None
+        for c in characters:
+            if c.name.lower() in name.lower() or name.lower() in c.name.lower():
+                char_status = c
+                break
+        
+        if not char_status:
+            continue
+            
+        previous_level = char_status.level
+        
+        # Apply HP change
+        hp_change = int(up.get("hp_change", 0))
+        if hp_change != 0:
+            char_status.hp = max(0, min(char_status.max_hp, char_status.hp + hp_change))
+            
+        # Apply XP and handle Level Up!
+        xp_gained = int(up.get("xp_gained", 0))
+        if xp_gained > 0:
+            char_status.xp += xp_gained
+            next_level_xp = char_status.level * 100
+            if char_status.xp >= next_level_xp:
+                char_status.level += 1
+                char_status.xp -= next_level_xp
+                char_status.max_hp += 5
+                char_status.hp = char_status.max_hp
+                
+        # Apply gold
+        gold_gained = int(up.get("gold_gained", 0))
+        if gold_gained != 0:
+            char_status.gold = max(0, char_status.gold + gold_gained)
+            
+        # Apply inventory changes
+        current_inv = []
+        try:
+            current_inv = json.loads(char_status.inventory)
+            if not isinstance(current_inv, list):
+                current_inv = []
+        except:
+            current_inv = []
+            
+        # Add items
+        items_added = up.get("items_added", [])
+        added_to_alert = []
+        for item in items_added:
+            new_item = {
+                "id": str(uuid.uuid4())[:8],
+                "name": item.get("name", "Item desconhecido"),
+                "type": item.get("type", "utility"),
+                "effect": item.get("effect", "Sem efeito mecânico")
+            }
+            current_inv.append(new_item)
+            added_to_alert.append(new_item)
+            
+        # Remove items
+        items_removed = up.get("items_removed", [])
+        removed_to_alert = []
+        for item_name in items_removed:
+            for idx, item in enumerate(current_inv):
+                if item_name.lower() in item["name"].lower() or item["name"].lower() in item_name.lower():
+                    removed_to_alert.append(current_inv.pop(idx))
+                    break
+                    
+        char_status.inventory = json.dumps(current_inv)
+        session.add(char_status)
+        
+        applied_updates.append({
+            "character_id": char_status.character_id,
+            "name": char_status.name,
+            "xp_gained": xp_gained,
+            "gold_gained": gold_gained,
+            "hp_change": hp_change,
+            "level_up": char_status.level > previous_level,
+            "level": char_status.level,
+            "items_added": added_to_alert,
+            "items_removed": removed_to_alert
+        })
+        
+    session.commit()
+    return applied_updates
